@@ -199,14 +199,40 @@ def find_robust_instance(model, bd_trigger, test_loader, device,
     )
 
 
-def enumerate_inductor_bool_flags(max_depth=3):
+def _read_inductor_config_dict():
     """
-    Walk torch._inductor.config recursively, collect (full_name, value, parent, attr).
-    Returns boolean attributes only, skipping diagnostic-style names.
+    Return a flat {dotted_name: value} snapshot of torch._inductor.config.
+
+    In torch >= 2.6, torch._inductor.config is wrapped by
+    torch.utils._config_module.install_config_module — the values live in
+    an internal `_config` dict and aren't visible to plain `dir()`. So we
+    read via the wrapper's public API (with a few fallbacks for version
+    drift), then fall back to a recursive dir() walk only if everything
+    else fails (older torch).
     """
+    cfg = torch._inductor.config
+
+    # Try public APIs (torch >= 2.1ish onward have at least one of these).
+    for attr in ('shallow_copy_dict', 'get_config_copy', 'to_dict'):
+        fn = getattr(cfg, attr, None)
+        if callable(fn):
+            try:
+                d = fn()
+                if d:
+                    return dict(d)
+            except Exception:
+                pass
+
+    # Try the private storage dict directly.
+    for attr in ('_config', '_config_dict'):
+        d = getattr(cfg, attr, None)
+        if isinstance(d, dict) and d:
+            return dict(d)
+
+    # Last-resort recursive dir() walk (legacy torch).
     primitive_skip = (int, float, str, bytes, list, tuple, dict, set,
                       frozenset, type(None))
-    results = []
+    flat = {}
     seen = set()
 
     def is_config_like(val):
@@ -215,11 +241,11 @@ def enumerate_inductor_bool_flags(max_depth=3):
             return True
         if isinstance(val, types.ModuleType):
             n = getattr(val, '__name__', '') or ''
-            return n.startswith('torch._inductor') or n.startswith('torch._dynamo')
+            return n.startswith('torch._inductor')
         return False
 
-    def visit(obj, prefix, depth):
-        if id(obj) in seen or depth > max_depth:
+    def visit(obj, prefix, depth=0):
+        if id(obj) in seen or depth > 4:
             return
         seen.add(id(obj))
         for name in sorted(dir(obj)):
@@ -229,36 +255,78 @@ def enumerate_inductor_bool_flags(max_depth=3):
                 val = getattr(obj, name)
             except Exception:
                 continue
-            full = f'{prefix}.{name}'
+            full = f'{prefix}.{name}' if prefix else name
             if isinstance(val, bool):
-                if any(s in name.lower() for s in SKIP_NAME_FRAGMENTS):
-                    continue
-                results.append((full, val, obj, name))
+                flat[full] = val
             elif callable(val) and not isinstance(val, type):
                 continue
             elif isinstance(val, primitive_skip):
-                continue
+                flat[full] = val
             elif is_config_like(val):
                 visit(val, full, depth + 1)
 
-    visit(torch._inductor.config, 'torch._inductor.config', 0)
-    # Deduplicate (parent objects may be reachable via multiple paths)
-    uniq = {}
-    for full, val, parent, attr in results:
-        uniq.setdefault((id(parent), attr), (full, val, parent, attr))
-    return list(uniq.values())
+    visit(cfg, '')
+    return flat
 
 
-def ablate_flag(model, batch_x, idx, parent, attr):
-    """Set parent.attr=False, fresh compile, run batch_x, read prediction at idx."""
-    saved = getattr(parent, attr)
-    setattr(parent, attr, False)
+def enumerate_inductor_bool_flags():
+    """
+    Return a list of (dotted_name, current_bool_value) for every bool-valued
+    attribute in torch._inductor.config (and nested config submodules), with
+    diagnostic-style names skipped.
+    """
+    flat = _read_inductor_config_dict()
+    out = []
+    for name, val in sorted(flat.items()):
+        if not isinstance(val, bool):
+            continue
+        if any(s in name.lower() for s in SKIP_NAME_FRAGMENTS):
+            continue
+        out.append((name, val))
+    return out
+
+
+def _walk_to_parent(cfg, dotted_name):
+    """Return (parent_obj, leaf_attr) for a dotted name like 'cpp.simdlen'."""
+    parts = dotted_name.split('.')
+    parent = cfg
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    return parent, parts[-1]
+
+
+def get_dotted(dotted_name):
+    parent, leaf = _walk_to_parent(torch._inductor.config, dotted_name)
+    return getattr(parent, leaf)
+
+
+def set_dotted(dotted_name, value):
+    parent, leaf = _walk_to_parent(torch._inductor.config, dotted_name)
+    setattr(parent, leaf, value)
+
+
+def ablate_flag(model, batch_x, idx, dotted_name):
+    """
+    Disable `torch._inductor.config.<dotted_name>`, fresh-compile model, run
+    batch_x, return prediction at index `idx`. Restore on exit.
+    """
+    try:
+        saved = get_dotted(dotted_name)
+    except Exception as e:
+        return None, f'GET_FAIL ({type(e).__name__}: {str(e)[:60]})'
+    try:
+        set_dotted(dotted_name, False)
+    except Exception as e:
+        return None, f'SET_FAIL ({type(e).__name__}: {str(e)[:60]})'
     try:
         return predict_at_idx(model, batch_x, idx), None
     except Exception as e:
         return None, f'{type(e).__name__}: {str(e).splitlines()[0][:80]}'
     finally:
-        setattr(parent, attr, saved)
+        try:
+            set_dotted(dotted_name, saved)
+        except Exception:
+            pass
         deep_reset()
 
 
@@ -317,8 +385,19 @@ def main():
     # ---------- Task 2 ----------
     print('\n[smoke] === Task 2: Inductor boolean-flag ablation ===')
     flags = enumerate_inductor_bool_flags()
-    enabled_flags = [t for t in flags if t[1] is True]
-    print(f'  found {len(flags)} bool flags total, {len(enabled_flags)} currently True')
+    enabled_flags = [(n, v) for n, v in flags if v is True]
+    print(f'  found {len(flags)} bool flags total, '
+          f'{len(enabled_flags)} currently True')
+    if not enabled_flags:
+        raise RuntimeError(
+            'enumeration returned 0 enabled bool flags — torch._inductor.config '
+            'reflection is broken on this torch version. The wrapper API has '
+            'changed; inspect torch._inductor.config.shallow_copy_dict() / '
+            '._config manually and report what you see.'
+        )
+    sample = [n for n, _ in enabled_flags[:8]]
+    print(f'  examples: {sample}'
+          f'{" ..." if len(enabled_flags) > 8 else ""}')
     if args.max_flags:
         enabled_flags = enabled_flags[:args.max_flags]
         print(f'  capped to first {args.max_flags}')
@@ -331,9 +410,9 @@ def main():
         0.0,
     )]
     t_start = time.time()
-    for i, (name, _val, parent, attr) in enumerate(enabled_flags, start=1):
+    for i, (name, _val) in enumerate(enabled_flags, start=1):
         t_iter = time.time()
-        new_pred, err = ablate_flag(model, eval_batch, idx, parent, attr)
+        new_pred, err = ablate_flag(model, eval_batch, idx, name)
         dt = time.time() - t_iter
         if err is not None:
             rows.append((name, None, None, f'ERROR ({err[:50]})', dt))
