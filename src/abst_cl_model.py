@@ -1,5 +1,4 @@
 import os
-import tvm
 import os.path
 from typing import List
 import numpy as np
@@ -8,7 +7,15 @@ import copy
 import torch
 import onnx
 import json
-from tvm import relay
+
+try:
+    import tvm
+    from tvm import relay
+    _HAS_TVM = True
+except ImportError:
+    tvm = None
+    relay = None
+    _HAS_TVM = False
 
 from .type_map import TorchTypeDict
 
@@ -203,6 +210,10 @@ class TorchCompiledModel(CompiledModel):
 
 class TVMCompiledModel(CompiledModel):
     def __init__(self, ori_model: TorchModel, compiled_model):
+        if not _HAS_TVM:
+            raise RuntimeError(
+                "TVM is not installed; TVMCompiledModel requires apache-tvm."
+            )
         super().__init__(ori_model, compiled_model)
 
     def forward(self, input_lists: List[torch.Tensor]) -> List[torch.Tensor]:

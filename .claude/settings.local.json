@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/dlcl.py'\\).read\\(\\)\\); print\\('dlcl.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/abst_cl_model.py'\\).read\\(\\)\\); print\\('abst_cl_model.py OK'\\)\")",
+      "Bash(python -c \"import json; json.load\\(open\\('colab_task0.ipynb'\\)\\); print\\('notebook JSON OK'\\)\")",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('colab_task0.ipynb'\\)\\); print\\('cells:', len\\(nb['cells']\\)\\); print\\('JSON OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/dlcl.py', encoding='utf-8'\\).read\\(\\)\\); print\\('src/dlcl.py: parse OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/abst_cl_model.py', encoding='utf-8'\\).read\\(\\)\\); print\\('src/abst_cl_model.py: parse OK'\\)\")"
+    ]
+  }
+}

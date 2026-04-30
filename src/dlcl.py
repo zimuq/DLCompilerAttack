@@ -1,18 +1,36 @@
 import os
 import time
 
-import tvm
-from tvm import relay
 import json
 import subprocess
 import torch
-from torch.export import export
-import onnxruntime as ort
 from pathlib import Path
-from tvm.contrib import graph_runtime
-from tvm.runtime import load_module, load_static_library, executor
-from tvm.contrib import utils, graph_executor
 import numpy as np
+
+try:
+    import tvm
+    from tvm import relay
+    from tvm.contrib import graph_runtime
+    from tvm.runtime import load_module, load_static_library, executor
+    from tvm.contrib import utils, graph_executor
+    _HAS_TVM = True
+except ImportError:
+    tvm = None
+    relay = None
+    graph_runtime = None
+    load_module = load_static_library = executor = None
+    utils = graph_executor = None
+    _HAS_TVM = False
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+try:
+    from torch.export import export
+except ImportError:
+    export = None
 
 
 from .abst_cl_model import TorchModel
@@ -23,14 +41,19 @@ from .abst_cl_model import TensorRTCompiledModel
 from .abst_cl_model import IREECompiledModel
 
 
-@tvm.instrument.pass_instrument
-class PrintIR:
-    """Print the name of the pass, the IR, only before passes execute."""
+if _HAS_TVM:
+    @tvm.instrument.pass_instrument
+    class PrintIR:
+        """Print the name of the pass, the IR, only before passes execute."""
 
-    def run_before_pass(self, mod, info):
-        pass
-        # print("Running pass: {}", info)
-        # print(mod)
+        def run_before_pass(self, mod, info):
+            pass
+            # print("Running pass: {}", info)
+            # print(mod)
+else:
+    class PrintIR:  # no-op stand-in when TVM is unavailable
+        def run_before_pass(self, mod, info):
+            pass
 
 
 class TargetDevice:
@@ -38,15 +61,15 @@ class TargetDevice:
         self.device_id = device_id
 
         if device_id == -1:
-            self.tvm_dev = tvm.cpu()
-            self.tvm_target = tvm.target.Target("llvm")
+            self.tvm_dev = tvm.cpu() if _HAS_TVM else None
+            self.tvm_target = tvm.target.Target("llvm") if _HAS_TVM else None
             self.torch_target = torch.device('cpu')
             self.onnx_target = 'CPUExecutionProvider'
             # self.trt_target = torch.device('cpu')
             # self.iree_target = torch.device('cpu')
         else:
-            self.tvm_target = tvm.target.cuda(arch="sm_86")
-            self.tvm_dev = tvm.cuda()
+            self.tvm_target = tvm.target.cuda(arch="sm_86") if _HAS_TVM else None
+            self.tvm_dev = tvm.cuda() if _HAS_TVM else None
             self.torch_target = torch.device('cuda')
             self.onnx_target = 'CUDAExecutionProvider'
             # self.trt_target = torch.device('cuda')
@@ -96,6 +119,10 @@ class DLCompiler:
             raise NotImplementedError
 
     def tvm_compile(self, model: TorchModel):
+        if not _HAS_TVM:
+            raise RuntimeError(
+                "TVM is not installed; install apache-tvm to use cl_id=1 (TVM compile)."
+            )
         opt_level = 3
         tvm_mod, params = relay.frontend.from_onnx(model.onnx_model)
 
@@ -121,6 +148,10 @@ class DLCompiler:
         return TorchCompiledModel(model, compiled_model, target_dev)
 
     def onnx_compile(self, model: TorchModel) -> OnnxCompiledModel:
+        if ort is None:
+            raise RuntimeError(
+                "onnxruntime is not installed; install onnxruntime (or onnxruntime-gpu) to use cl_id=2."
+            )
         target = model.target_device
         onnx_path = os.path.join(model.work_dir, f"{model.model_name}_opt.onnx")
         model.torch2onnx(do_constant_folding=True, onnx_path=onnx_path, dynamic_axes=False)
