@@ -351,6 +351,27 @@ def compute_loss_masked(D, act, tuned_model, compiled_model, bd_trigger, batch,
 # Per-variant training
 # ---------------------------------------------------------------------------
 
+def load_stage1_checkpoint(step1_path, device):
+    """Load <task_name>.step1 saved by src/attack/v_search.py:165 as
+    [D, act, tuned_model, bd_trigger]. Distinguish from best.tar (which
+    has 3 items, [bd_trigger, MyModel, acc]) so the user gets a helpful
+    error if they pass the wrong path."""
+    loaded = torch.load(step1_path, weights_only=False, map_location=device)
+    if not isinstance(loaded, list) or len(loaded) != 4:
+        n = len(loaded) if hasattr(loaded, '__len__') else '?'
+        raise RuntimeError(
+            f'Expected Stage-1 checkpoint at {step1_path!r} containing '
+            f'[D, act, tuned_model, bd_trigger] (4 items), got '
+            f'{type(loaded).__name__} with {n} item(s).\n'
+            'Hint: best.tar contains [bd_trigger, MyModel, acc] (3 items) '
+            'and is NOT the Stage-1 checkpoint. The Stage-1 file is named '
+            '<task_name>.step1 (e.g. '
+            'convnet::::cifar10::::CL___0::::_GPU_.step1) and lives in the '
+            'same work_dir. See src/attack/v_search.py:165 for the save call.'
+        )
+    return loaded
+
+
 def train_one_variant(args, variant_id, mode, removed_indices,
                       train_loader, test_loader, hardware_target, cl_func,
                       device, baseline_loss_epoch0_ref):
@@ -365,8 +386,8 @@ def train_one_variant(args, variant_id, mode, removed_indices,
     os.makedirs(variant_dir, exist_ok=True)
 
     print(f'\n[{variant_id}] loading Stage-1 checkpoint ...')
-    [D, act, tuned_model, bd_trigger] = torch.load(
-        args.step1_path, weights_only=False, map_location=device,
+    [D, act, tuned_model, bd_trigger] = load_stage1_checkpoint(
+        args.step1_path, device
     )
     bd_trigger = move_bd_trigger_to(bd_trigger, device)
 
@@ -505,8 +526,8 @@ def dry_run_one_variant(args, variant_id, mode, removed_indices,
     variant_dir = os.path.join(args.out_dir, variant_id)
     os.makedirs(variant_dir, exist_ok=True)
 
-    [D, act, tuned_model, bd_trigger] = torch.load(
-        args.step1_path, weights_only=False, map_location=device,
+    [D, act, tuned_model, bd_trigger] = load_stage1_checkpoint(
+        args.step1_path, device
     )
     bd_trigger = move_bd_trigger_to(bd_trigger, device)
     D = D.to(device).eval()
